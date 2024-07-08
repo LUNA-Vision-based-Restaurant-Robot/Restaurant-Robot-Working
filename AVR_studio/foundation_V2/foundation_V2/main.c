@@ -1,14 +1,13 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
+#include <util/delay.h>
+#include <avr/eeprom.h>
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#define F_CPU 16000000UL // Define CPU frequency
 
 // Define the sensor pins
-#define NUM_SENSORS 5
 const uint8_t sensorPins[NUM_SENSORS] = {PC0, PC1, PC2, PC3, PC4};
 
 // Define the weights for each sensor
@@ -27,11 +26,18 @@ float error = 0, lastError = 0;
 float integral = 0, derivative = 0;
 float correction = 0;
 
-
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#define F_CPU 16000000UL // Define CPU frequency
+
+// Define the number of sensors
+#define NUM_SENSORS 5
+
+// EEPROM addresses
+#define LEFT_ADDR 0x00
+#define METADATA_START_ADDR 0x02
 
 // Motor control pins
 #define leftMotorPin DDB1
@@ -69,17 +75,21 @@ float correction = 0;
 #define SEG_F PD5
 #define SEG_G PD6
 
-// Maximum speeds and accelerations in MPS and MPS^2
-#define MAX_SPEED 0.000186411
-#define MAX_ACCELERATION 3.36
-#define MAX_DECELERATION 5.59
+// Maximum speeds and accelerations in mps and mps^2
+#define MAX_SPEED 0.25
+#define MAX_ACCELERATION 2.5
+#define MAX_DECELERATION 1.5
 
 #define accelerationStep 2
 #define decelerationStep 2
 
 #define M_PI 3.142
 
-#define currentSpeed 0.00009
+#define currentSpeed 0.125
+
+// motor pins
+#define MOTOR_LEFT OCR1A
+#define MOTOR_RIGHT OCR1B
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -117,6 +127,21 @@ volatile uint32_t milliseconds = 0; // Milliseconds counter
 
 uint8_t serving_state = 1; // 1: not served, 2: served, 3: return to starting point
 
+uint8_t left_count = 0; // Number of junctions to the left of the starting point
+
+//array to store the table metadata
+uint16_t table_metadata[MAX_TABLE_COUNT][2];
+
+uint8_t current_order = 0; // Current table oder
+uint8_t junction_number_for_table = 0 // Number of junctions for the current table
+uint8_t junction_left = 0; // initial junction is at the left of the robots start
+
+uint8_t junction_achieved = 0; // 1: junction start achieved, 0: junction start not achieved, 2: junction table achieved
+
+uint8_t current_junction = 0; // Current junction number
+
+uint8_t is_target_junction_odd = 0; // 0: even, 1: odd
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -124,37 +149,56 @@ uint8_t serving_state = 1; // 1: not served, 2: served, 3: return to starting po
 uint32_t millis();
 long readUltrasonicDistance(uint8_t trigPin, uint8_t echoPin);
 long pulseIn(uint8_t pin, uint8_t state);
+void setMotorSpeed(int leftSpeed, int rightSpeed);
+void changeOrientation(uint8_t angle);
+void moveToStartingPoint();
+uint8_t isObstacleDetected();
+uint8_t debounce_button(uint8_t pin);
+int readAnalog(uint8_t pin);
+int constrain(int value, int min, int max);
+void display_digit(uint8_t digit);
+float calculate_distance_traveled(int encoderCount);
+void PID_travel(uint8_t weightedSum);
+void retrieve_data_from_eeprom();
+void init_timer();
+void deceleartion_to_stop();
+void acceleration_to_speed();
 
-void _delay_ms(uint16_t ms) {
-	uint32_t start = millis();
-	while(millis() - start < ms){
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-	}
+void retrieve_data_from_eeprom() {
+    // Retrieve left variable from EEPROM
+    uint8_t left = eeprom_read_byte((const uint8_t*)LEFT_ADDR);
+
+	//save the value to global variable
+	left_count = left;
+
+    // Retrieve table_metadata from EEPROM
+    uint16_t metadata_addr = METADATA_START_ADDR;
+    for (uint8_t i = 0; i < MAX_TABLE_COUNT; i++) {
+        uint16_t table_number = eeprom_read_word((const uint16_t*)(metadata_addr + i*6));
+        uint16_t start_junction = eeprom_read_word((const uint16_t*)(metadata_addr + i*6 + 2));
+        int16_t count = eeprom_read_word((const uint16_t*)(metadata_addr + i*6 + 4));
+
+		table_metadata[i][0] = start_junction;
+		table_metadata[i][1] = count;
+    }
 }
-
-void _delay_us(uint16_t us) {
-	uint32_t start = millis()*1000;
-	while(millis()*1000 - start < us){
-
-	}
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void setMotorSpeed(int leftSpeed, int rightSpeed) {
 	// Function to set motor speeds
 	// Example using PWM for motor driver
-	OCR1A = leftSpeed;
-	OCR1B = rightSpeed;
+	MOTOR_LEFT = leftSpeed;
+	MOTOR_RIGHT = rightSpeed;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void turnBend(uint8_t angle) {
+void changeOrientation(uint8_t angle) { //double check the name for "orientation"
 
 	//Calculate the bend angle
 	uint8_t bendAngle = angle * countsPer90DegreeTurn / 90;
@@ -278,69 +322,29 @@ ISR(INT1_vect) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-ISR(TIMER1_COMPA_vect) {
-	// Timer1 interrupt service routine, called every TIMER_INTERVAL_MS milliseconds
-	int leftEncoderDelta = leftEncoderCount - leftEncoderCountPrev;
-	int rightEncoderDelta = rightEncoderCount - rightEncoderCountPrev;
-	leftEncoderCountPrev = leftEncoderCount;
-	rightEncoderCountPrev = rightEncoderCount;
+	ISR(TIMER1_COMPA_vect) {
+		// Timer1 interrupt service routine, called every TIMER_INTERVAL_MS milliseconds
+		int leftEncoderDelta = leftEncoderCount - leftEncoderCountPrev;
+		int rightEncoderDelta = rightEncoderCount - rightEncoderCountPrev;
+		leftEncoderCountPrev = leftEncoderCount;
+		rightEncoderCountPrev = rightEncoderCount;
 
-	// Calculate the speed in counts per second
-	float leftSpeedCPS = (float)leftEncoderDelta / (TIMER_INTERVAL_MS / 1000.0);
-	float rightSpeedCPS = (float)rightEncoderDelta / (TIMER_INTERVAL_MS / 1000.0);
+		// Calculate the speed in counts per second
+		float leftSpeedCPS = (float)leftEncoderDelta / (TIMER_INTERVAL_MS / 1000.0);
+		float rightSpeedCPS = (float)rightEncoderDelta / (TIMER_INTERVAL_MS / 1000.0);
 
-	// Calculate the speed in meters per second
-	leftSpeedMPS = leftSpeedCPS / COUNTS_PER_REVOLUTION * 2 * M_PI * WHEEL_RADIUS;
-	rightSpeedMPS = rightSpeedCPS / COUNTS_PER_REVOLUTION * 2 * M_PI * WHEEL_RADIUS;
+		// Calculate the speed in meters per second
+		leftSpeedMPS = leftSpeedCPS / COUNTS_PER_REVOLUTION * 2 * M_PI * WHEEL_RADIUS;
+		rightSpeedMPS = rightSpeedCPS / COUNTS_PER_REVOLUTION * 2 * M_PI * WHEEL_RADIUS;
 
-	// Calculate the acceleration in meters per second squared
-	leftAccelerationMPS2 = (leftSpeedMPS - leftSpeedPrev) / (TIMER_INTERVAL_MS / 1000.0);
-	rightAccelerationMPS2 = (rightSpeedMPS - rightSpeedPrev) / (TIMER_INTERVAL_MS / 1000.0);
+		// Calculate the acceleration in meters per second squared
+		leftAccelerationMPS2 = (leftSpeedMPS - leftSpeedPrev) / (TIMER_INTERVAL_MS / 1000.0);
+		rightAccelerationMPS2 = (rightSpeedMPS - rightSpeedPrev) / (TIMER_INTERVAL_MS / 1000.0);
 
-	// Update previous speeds
-	leftSpeedPrev = leftSpeedMPS;
-	rightSpeedPrev = rightSpeedMPS;
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-ISR(TIMER0_COMPA_vect) {
-	// Increment milliseconds every 1 ms
-	milliseconds++;
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void init_timer() {
-	// Set up Timer1 for CTC mode
-	TCCR1B |= (1 << WGM12); // Configure timer 1 for CTC mode
-	TIMSK1 |= (1 << OCIE1A); // Enable CTC interrupt
-	OCR1A = (F_CPU / 1000) * TIMER_INTERVAL_MS / 64 - 1; // Set CTC compare value for 100ms interval with 64 prescaler
-	TCCR1B |= (1 << CS11) | (1 << CS10); // Start timer at Fcpu/64
-
-	// Configure Timer0 for CTC mode to generate a 1 ms interrupt
-	TCCR0A |= (1 << WGM01); // CTC mode
-	OCR0A = F_CPU / 1000 / 64 - 1; // Set CTC compare value for 1 ms interval with 64 prescaler
-	TIMSK0 |= (1 << OCIE0A); // Enable CTC interrupt
-	TCCR0B |= (1 << CS01) | (1 << CS00); // Start timer at Fcpu/64
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-uint32_t millis() {
-	uint32_t ms;
-	// Disable interrupts to read milliseconds safely
-	cli();
-	ms = milliseconds;
-	sei();
-	return ms;
-}
+		// Update previous speeds
+		leftSpeedPrev = leftSpeedMPS;
+		rightSpeedPrev = rightSpeedMPS;
+	}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -378,7 +382,7 @@ int readAnalog(uint8_t pin) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-int constrain(int value, int min, int max) {
+int constrain(int value, int min, int max) { //check "saturation"
 	if (value < min) return min;
 	if (value > max) return max;
 	return value;
@@ -504,6 +508,73 @@ void PID_travel(uint8_t weightedSum) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+void decelerate_to_stop(){
+	// Control motor speed based on deceleration and speed
+	uint8_t left_motor_speed = 0;
+	uint8_t right_motor_speed = 0;
+
+	// Decelerate the motors until they come to a stop
+	uint8_t speedReached = 0;
+
+	if (leftSpeedMPS > 0) {
+		left_motor_speed -= (leftAccelerationMPS2 > -MAX_DECELERATION) ? 1 : 0;
+		} else {
+		left_motor_speed = 0;
+		speedReached = 1;
+	}
+
+	if (rightSpeedMPS > 0) {
+		right_motor_speed -= (rightAccelerationMPS2 > -MAX_DECELERATION) ? 1 : 0;
+		} else {
+		right_motor_speed = 0;
+		speedReached = 1;
+	}
+
+	// Set motor speeds
+	setMotorSpeed(left_motor_speed, right_motor_speed);
+	if (speedReached == 1) {
+		mode = 1; // Set mode to normal operation
+	}
+	speedReached = 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void acceleration_to_speed(){
+	// Control motor speed based on acceleration and speed
+	uint8_t left_motor_speed = 0;
+	uint8_t right_motor_speed = 0;
+
+	// Accelerate the motors until the maximum speed is reached
+	uint8_t speedReached = 0;
+
+	if (leftSpeedMPS < MAX_SPEED) {
+		left_motor_speed += (leftAccelerationMPS2 < MAX_ACCELERATION) ? 1 : -1;
+		} else {
+		left_motor_speed = 0;
+		speedReached = 1;
+	}
+
+	if (rightSpeedMPS < MAX_SPEED) {
+		right_motor_speed += (rightAccelerationMPS2 < MAX_ACCELERATION) ? 1 : -1;
+		} else {
+		right_motor_speed = 0;
+		speedReached = 1;
+	}
+
+	// Set motor speeds
+	setMotorSpeed(left_motor_speed, right_motor_speed);
+	if (speedReached == 1) {
+		mode = 1; // Set mode to normal operation
+	}
+	speedReached = 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////MAIN/////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -518,6 +589,8 @@ int main(void) {
 	// Set up PWM for motors
 	TCCR1A = (1 << WGM10) | (1 << COM1A1) | (1 << COM1B1); // 8-bit Fast PWM
 	TCCR1B = (1 << WGM12) | (1 << CS11); // Prescaler 8
+	MOTOR_LEFT = 0; // Initialize OCR1A (left motor speed)
+  	MOTOR_RIGHT = 0; // Initialize OCR1B (right motor speed)
 
 	// Initialize encoder pins as input
 	// Set encoder pins as inputs
@@ -548,6 +621,9 @@ int main(void) {
 
 	// Initialize timers for counts
 	init_timer();
+
+	// Initialize the robot
+	retrieve_data_from_eeprom();
 
 	///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 	//////////////////////////////////////////////LOOP/////////////////////////////////////////////////////////////
@@ -581,6 +657,16 @@ int main(void) {
 		if (debounce_button(BUTTON_PIN_START)) {
 			start_state = 1; // Start the robot
 			mode = 2; // Set mode to accelerating
+			// Set the current order for the table
+			current_order = table_metadata[table_number-1][0];
+			// Set the junction number for the table
+			junction_number_for_table = table_metadata[table_number-1][1];
+			//set the odd or even junction paramater
+			is_target_junction_odd = junction_number_for_table % 2;
+			// Set the state of the intial junctions
+			if (junction_number_for_table < left){
+				junction_left = 1;
+			}
 			// Wait until button is released
 			while (debounce_button(BUTTON_PIN_START));
 		}
@@ -591,6 +677,7 @@ int main(void) {
 
 		if(start_state == 1){
 
+			// For finishing the serving
 			if (serving_state == 2){
 
 				while(1){
@@ -602,9 +689,15 @@ int main(void) {
 					}
 				}
 				// Move the robot back to the starting point
-				turnBend(0);    // Turn 90 degrees back
-
-				} if (serving_state == 3) {
+				if (is_target_junction_odd){
+					changeOrientation(90);    // Turn 90 degrees
+				} else {
+					changeOrientation(-90);    // Turn 90 degrees
+				}
+			}
+			
+			// For returning to the starting point
+			if (serving_state == 3) {
 
 				// Read the sensor values and calculate the weighted sum and the sum
 				for (uint8_t i = 0; i < NUM_SENSORS; i++) {
@@ -622,26 +715,72 @@ int main(void) {
 
 				// Increment stop count if all sensors are high
 				if (allSensorsHigh == 1) {
-					if (millis() - previous_table_count_update_time > MIN_TIME_INTERVAL) {
-						table_count--;
-						previous_table_count_update_time = millis();
+
+					if (junction_achieved == 2){
+						if (millis() - previous_table_count_update_time > MIN_TIME_INTERVAL) {
+							table_count--;
+							previous_table_count_update_time = millis();
+						}
+
+						if (stopCount >= stopCountThreshold) {
+							mode = 0; // Set mode to decelerating
+						}
+
+						if (table_count == 0) {
+
+						//decelerate to stop
+						decelerationStep();
+						
+						if (junction_left){
+							changeOrientation(-90);    // Turn 90 degrees
+						} else {
+							changeOrientation(90);    // Turn 90 degrees
+						}
+
+						junction_achieved = 1; // Set the junction mode to finging the start junction
+
+						table_number = 0; // Reset the table number
+						}
 					}
-					if (stopCount >= stopCountThreshold) {
-						mode = 0; // Set mode to decelerating
+
+					if (junction_achieved == 1){
+						if (junction_left){
+							current_juction++;
+						} else {
+							current_junction--;
+						}
+
+						if (current_junction == left + 1){
+							//decelerate to stop
+							decelerationStep();
+`
+							if (junction_left){
+								changeOrientation(-90);    // Turn 90 degrees
+							} else {
+								changeOrientation(90);    // Turn 90 degrees
+							}
+						}
+
+						junction_achieved = 0; // Set the junction mode to finging the start junction
+					}
+
+					if (junction_achieved == 0){
+						//decelerate to stop
+						decelerationStep();
+						start_state = 0; // Set the start state to 0
+						table_number = 0; // Reset the table number
+						current_order = 0; // Reset the current order
+						junction_number_for_table = 0; // Reset the junction number for the table
+						junction_left = 0; // Reset the junction left
+						junction_achieved = 0; // Reset the junction achieved
 					}
 				}
-
-				if (table_count == 0) {
-					turnBend(180);    // Turn 90 degrees back
-					serving_state = 1; // Set the serving state to none
-					start_state = 0; // Set the start to false
-					table_number = 0; // Reset the table number
-				}
-
 
 				PID_travel(weightedSum);
+
+			//////////////////////////////Foor serving operation///////////////////////////
 				
-				} else {
+			} else {
 
 				// Start the robot with the acceleration from the speed profile
 				if (mode == 2){
@@ -762,47 +901,53 @@ int main(void) {
 
 				// Increment stop count if all sensors are high
 				if (allSensorsHigh == 1) {
-					if (millis() - previous_table_count_update_time > MIN_TIME_INTERVAL) {
-						table_count++;
-						previous_table_count_update_time = millis();
-					}
-					if (stopCount >= stopCountThreshold) {
-						mode = 0; // Set mode to decelerating
+					if (junction_achieved == 0){
+						junction_achieved = 1;
+						//decelerate to stop
+						decelerationStep();
+
+						if (junction_left == 1){
+							changeOrientation(-90);    // Turn 90 degrees
+						} else {
+							changeOrientation(90);    // Turn 90 degrees
+						}
+						current_junction = left + 1; // Set the current junction to the left with an increment of 1
+
+					} else if (junction_achieved == 1) {
+
+						if (junction_left){
+							current_juction--;
+						} else {
+							current_junction++;
+						}
+
+						if (current_junction == junction_number_for_table){
+							junction_achieved = 2;
+							if (current_order < 0){
+								changeOrientation(90);
+							} else {
+								changeOrientation(-90);
+							}
+						}
+					
+					} else {
+						if (millis() - previous_table_count_update_time > MIN_TIME_INTERVAL) {
+							table_count++;
+							previous_table_count_update_time = millis();
+						}
+						if (stopCount >= stopCountThreshold) {
+							mode = 0; // Set mode to decelerating
+						}
 					}
 				}
 
 				if (table_number == table_count){
-					while (1) {
-						// Control motor speed based on deceleration and speed
-						uint8_t left_motor_speed = 0;
-						uint8_t right_motor_speed = 0;
-
-						// Decelerate the motors until they come to a stop
-						uint8_t speedReached = 0;
-
-						if (leftSpeedMPS > 0) {
-							left_motor_speed -= (leftAccelerationMPS2 > -MAX_DECELERATION) ? 1 : 0;
-							} else {
-							left_motor_speed = 0;
-							speedReached = 1;
-						}
-
-						if (rightSpeedMPS > 0) {
-							right_motor_speed -= (rightAccelerationMPS2 > -MAX_DECELERATION) ? 1 : 0;
-							} else {
-							right_motor_speed = 0;
-							speedReached = 1;
-						}
-
-						// Set motor speeds
-						setMotorSpeed(left_motor_speed, right_motor_speed);
-						if (speedReached == 1) {
-							mode = 1; // Set mode to normal operation
-							break;
-						}
-						speedReached = 0; //break the deceleration loop when speed has gotten to zero
+					decelerationStep(); //decelerate to stop
+					if (is_target_junction_odd){
+						changeOrientation(-90);    // Turn 90 degrees
+					} else {
+						changeOrientation(90);    // Turn 90 degrees
 					}
-					turnBend(90);    // Turn 90 degrees
 					serving_state = 1; // Set the serving state to true
 				}
 
